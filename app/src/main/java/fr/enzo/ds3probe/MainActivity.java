@@ -2,6 +2,8 @@ package fr.enzo.ds3probe;
 
 import android.app.Activity;
 import android.content.BroadcastReceiver;
+import android.content.ComponentName;
+import android.content.ServiceConnection;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Context;
@@ -20,6 +22,8 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.IBinder;
+import android.os.Parcel;
 import android.os.Looper;
 import android.provider.MediaStore;
 import android.provider.Settings;
@@ -32,6 +36,7 @@ import android.widget.TextView;
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
@@ -89,6 +94,15 @@ public class MainActivity extends Activity {
             "ro.build.display", "ro.board", "ro.hardware", "jitu", "bus"
     };
 
+    private static final String[] KNOWN_ACTIONS = {
+            "com.qf.vehicle.action.DOOR_WINDOW", "com.qf.vehicle.action.RADAR",
+            "com.qf.vehicle.action.swa", "com.qf.action.headlight_state",
+            "com.qf.action.BACKCAR_START", "com.qf.action.BACKCAR_STOP",
+            "com.qf.action.ACC_ON", "com.qf.action.ACC_OFF",
+            "com.qf.vehicle.action.ac_popup", "com.qf.vehicle.action.PANEL_KEY",
+            "com.qf.vehicle.ACTION_DataTrace"
+    };
+
     private static final Pattern ACTION_LIKE =
             Pattern.compile("^[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z0-9_]+){2,}$");
 
@@ -97,6 +111,8 @@ public class MainActivity extends Activity {
     private final Set<String> candidateActions = Collections.synchronizedSet(new TreeSet<>());
     private final Set<String> candidateUris = Collections.synchronizedSet(new TreeSet<>());
     private final Set<String> providerAuthorities = Collections.synchronizedSet(new TreeSet<>());
+    private final List<ComponentName> qfServices = Collections.synchronizedList(new ArrayList<>());
+    private volatile String canbusApk = null;
 
     private TextView out;
     private TextView info;
@@ -129,9 +145,11 @@ public class MainActivity extends Activity {
         btnListen = makeButton("2. Écouter");
         Button btnSave = makeButton("Enregistrer");
         Button btnClear = makeButton("Effacer");
+        Button btnApk = makeButton("Copier APK");
         row.addView(btnScan, weight());
         row.addView(btnListen, weight());
         row.addView(btnSave, weight());
+        row.addView(btnApk, weight());
         row.addView(btnClear, weight());
 
         info = new TextView(this);
@@ -156,6 +174,7 @@ public class MainActivity extends Activity {
         btnScan.setOnClickListener(v -> startScan());
         btnListen.setOnClickListener(v -> toggleListen());
         btnSave.setOnClickListener(v -> saveReport());
+        btnApk.setOnClickListener(v -> new Thread(this::copyCanbusApk, "apk").start());
         btnClear.setOnClickListener(v -> {
             synchronized (report) { report.setLength(0); }
             out.setText("");
@@ -163,7 +182,7 @@ public class MainActivity extends Activity {
         });
 
         startServer();
-        log("DS3 Probe 1.0 — " + now());
+        log("DS3 Probe 1.1 — " + now());
         log("Étape 1 : appuie sur « 1. Scanner » (1 à 2 minutes).");
         log("Étape 2 : appuie sur « 2. Écouter », puis ouvre une portière, passe la marche");
         log("          arrière, allume les phares, démarre... puis réappuie pour arrêter.");
@@ -244,6 +263,7 @@ public class MainActivity extends Activity {
                 scanProps();
                 scanPackages();
                 scanProviders();
+                probeServices();
                 scanSettings();
                 scanSerial();
                 section("RÉSUMÉ");
@@ -335,6 +355,7 @@ public class MainActivity extends Activity {
             log("Nom : " + label + " | APK : " + ai.sourceDir + " | uid " + ai.uid);
             if (ai.sharedLibraryFiles != null) log("Libs : " + Arrays.toString(ai.sharedLibraryFiles));
 
+            if (pkg.equals("com.qf.vehicle")) canbusApk = ai.sourceDir;
             dumpComponents(pm, pkg);
             scanDex(ai);
         }
@@ -353,6 +374,7 @@ public class MainActivity extends Activity {
         if (pi == null) return;
 
         if (pi.services != null) for (ServiceInfo s : pi.services) {
+            if (s.exported && pkg.startsWith("com.qf.")) qfServices.add(new ComponentName(pkg, s.name));
             log("  service  " + s.name + (s.exported ? " [exporté]" : "")
                     + (s.permission != null ? " perm=" + s.permission : ""));
         }
@@ -377,6 +399,7 @@ public class MainActivity extends Activity {
         Set<String> actions = new TreeSet<>();
         Set<String> uris = new TreeSet<>();
         Set<String> keywords = new TreeSet<>();
+        Set<String> classes = new TreeSet<>();
         int dexCount = 0;
 
         for (String f : files) {
@@ -388,7 +411,7 @@ public class MainActivity extends Activity {
                     if (!(n.startsWith("classes") && n.endsWith(".dex"))) continue;
                     dexCount++;
                     byte[] data = readAll(zip.getInputStream(e));
-                    extractStrings(data, actions, uris, keywords);
+                    extractStrings(data, actions, uris, keywords, classes);
                 }
             } catch (Throwable t) {
                 log("  (lecture APK impossible : " + t.getClass().getSimpleName() + ")");
@@ -413,6 +436,15 @@ public class MainActivity extends Activity {
             candidateUris.addAll(uris);
         }
 
+        if (!classes.isEmpty()) {
+            log("  Interfaces / entités / AIDL (" + classes.size() + ") :");
+            n = 0;
+            for (String k : classes) {
+                if (n++ >= 600) { log("    …"); break; }
+                log("    " + k);
+            }
+        }
+
         if (!keywords.isEmpty()) {
             log("  Chaînes « données voiture » (" + keywords.size() + ") :");
             n = 0;
@@ -434,7 +466,7 @@ public class MainActivity extends Activity {
     }
 
     private void extractStrings(byte[] data, Set<String> actions, Set<String> uris,
-                                Set<String> keywords) {
+                                Set<String> keywords, Set<String> classes) {
         StringBuilder cur = new StringBuilder();
         for (int i = 0; i <= data.length; i++) {
             int b = i < data.length ? (data[i] & 0xff) : 0;
@@ -442,12 +474,33 @@ public class MainActivity extends Activity {
                 cur.append((char) b);
                 continue;
             }
-            if (cur.length() >= 6) classify(cur.toString(), actions, uris, keywords);
+            // Dans un .dex, chaque chaîne est précédée de sa longueur : on retire cet octet.
+            if (b == 0 && cur.length() >= 33 && cur.charAt(0) == cur.length() - 1) cur.deleteCharAt(0);
+            if (cur.length() >= 6) classify(cur.toString(), actions, uris, keywords, classes);
             cur.setLength(0);
         }
     }
 
-    private void classify(String s, Set<String> actions, Set<String> uris, Set<String> keywords) {
+    private void classify(String s, Set<String> actions, Set<String> uris, Set<String> keywords,
+                          Set<String> classes) {
+        if (s.startsWith("TRANSACTION_") || s.startsWith("DESCRIPTOR")) {
+            classes.add(s);
+            return;
+        }
+        if (s.startsWith("Lcom/") && s.endsWith(";") && !s.contains("$$")) {
+            String simple = s.substring(s.lastIndexOf('/') + 1, s.length() - 1);
+            String l = s.toLowerCase(Locale.ROOT);
+            boolean aidlLike = simple.length() > 2 && simple.charAt(0) == 'I'
+                    && Character.isUpperCase(simple.charAt(1));
+            if (aidlLike || l.contains("/entity/") || l.contains("/aidl/") || l.contains("stub")
+                    || l.contains("callback") || l.contains("listener") || l.contains("/bean/")
+                    || l.contains("manager;") || l.contains("service;") || l.contains("canbus")
+                    || l.contains("vehicle")) {
+                if (l.startsWith("lcom/qf/") || l.startsWith("lcom/txz") || l.contains("can")
+                        || l.contains("vehicle") || l.contains("car")) classes.add(s);
+            }
+            return;
+        }
         if (s.startsWith("content://")) {
             if (!s.contains("%") && !s.contains(" ") && s.length() < 150) uris.add(s);
             return;
@@ -460,6 +513,10 @@ public class MainActivity extends Activity {
                 return;
             }
             String last = s.substring(s.lastIndexOf('.') + 1);
+            if (l.startsWith("com.qf.") && last.length() > 2 && last.charAt(0) == 'I'
+                    && Character.isUpperCase(last.charAt(1))) {
+                classes.add(s + "   (descripteur AIDL probable)");
+            }
             boolean upperLast = last.length() >= 3 && last.equals(last.toUpperCase(Locale.ROOT))
                     && last.matches(".*[A-Z].*");
             if (l.contains("action") || upperLast) {
@@ -582,6 +639,75 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void probeServices() {
+        section("SERVICES QF (descripteurs AIDL)");
+        List<ComponentName> list;
+        synchronized (qfServices) { list = new ArrayList<>(qfServices); }
+        if (list.isEmpty()) { log("(aucun service QF exporté)"); return; }
+        for (ComponentName cn : list) {
+            final Object lock = new Object();
+            final String[] result = {null};
+            ServiceConnection conn = new ServiceConnection() {
+                @Override
+                public void onServiceConnected(ComponentName name, IBinder service) {
+                    String d;
+                    try { d = service == null ? "binder null" : service.getInterfaceDescriptor(); }
+                    catch (Throwable t) { d = "erreur " + t.getClass().getSimpleName(); }
+                    synchronized (lock) { result[0] = "connecté, descripteur = " + d; lock.notifyAll(); }
+                }
+                @Override
+                public void onServiceDisconnected(ComponentName name) { }
+            };
+            boolean ok;
+            try {
+                Intent i = new Intent();
+                i.setComponent(cn);
+                // flag 0 : on ne démarre rien, on se connecte seulement si le service tourne déjà.
+                ok = bindService(i, conn, 0);
+            } catch (Throwable t) {
+                log("  " + cn.flattenToShortString() + " → refusé : " + t.getClass().getSimpleName()
+                        + " " + cut(String.valueOf(t.getMessage()), 100));
+                continue;
+            }
+            if (!ok) {
+                log("  " + cn.flattenToShortString() + " → bindService=false");
+                continue;
+            }
+            synchronized (lock) {
+                try { if (result[0] == null) lock.wait(4000); } catch (InterruptedException ignored) { }
+            }
+            log("  " + cn.flattenToShortString() + " → "
+                    + (result[0] != null ? result[0] : "pas de réponse (service non démarré ?)"));
+            try { unbindService(conn); } catch (Throwable ignored) { }
+        }
+    }
+
+    private void copyCanbusApk() {
+        String src = canbusApk;
+        if (src == null) src = "/system/priv-app/QF_Canbus/QF_Canbus.apk";
+        File f = new File(src);
+        if (!f.canRead()) { log("APK illisible : " + src); return; }
+        try {
+            ContentValues cv = new ContentValues();
+            cv.put(MediaStore.MediaColumns.DISPLAY_NAME, "QF_Canbus.apk.bin");
+            cv.put(MediaStore.MediaColumns.MIME_TYPE, "application/octet-stream");
+            cv.put(MediaStore.MediaColumns.RELATIVE_PATH, "Download");
+            Uri u = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv);
+            if (u == null) throw new IllegalStateException("insert null");
+            try (InputStream in = new FileInputStream(f);
+                 OutputStream os = getContentResolver().openOutputStream(u)) {
+                if (os == null) throw new IllegalStateException("flux null");
+                byte[] buf = new byte[65536];
+                int r;
+                while ((r = in.read(buf)) > 0) os.write(buf, 0, r);
+            }
+            log("APK canbus copié : Download/QF_Canbus.apk.bin (" + (f.length() / 1024) + " Ko)");
+            log("Ou depuis l'iPhone : même adresse, mais finissant par /canbus.apk");
+        } catch (Throwable t) {
+            log("Copie APK impossible : " + t);
+        }
+    }
+
     // ------------------------------------------------------------------ ÉCOUTE
 
     private void toggleListen() {
@@ -590,14 +716,14 @@ public class MainActivity extends Activity {
             return;
         }
         if (candidateActions.isEmpty()) {
-            log("Lance d'abord « 1. Scanner ».");
-            return;
+            log("(Scan non lancé : écoute des actions connues seulement.)");
         }
         IntentFilter filter = new IntentFilter();
         int n = 0;
+        for (String a : KNOWN_ACTIONS) { filter.addAction(a); n++; }
         synchronized (candidateActions) {
             for (String a : candidateActions) {
-                filter.addAction(a);
+                if (!filter.hasAction(a)) filter.addAction(a);
                 if (++n >= 3000) break;
             }
         }
@@ -641,10 +767,17 @@ public class MainActivity extends Activity {
 
     private void onSniffed(Intent intent) {
         String action = String.valueOf(intent.getAction());
+        String raw = rawIntent(intent);
         Integer c = counts.get(action);
         counts.put(action, c == null ? 1 : c + 1);
 
-        String extras = describeExtras(intent.getExtras());
+        String extras;
+        try {
+            extras = describeExtras(intent.getExtras());
+        } catch (Throwable t) {
+            extras = "{illisible:" + t.getClass().getSimpleName() + "}";
+        }
+        if (extras.contains("illisible")) extras = extras + "  RAW=" + raw;
         long t = System.currentTimeMillis();
         String prev = lastExtras.get(action);
         Long prevT = lastTime.get(action);
@@ -653,6 +786,28 @@ public class MainActivity extends Activity {
         lastExtras.put(action, extras);
         lastTime.put(action, t);
         log(time() + "  " + action + "  " + extras);
+    }
+
+    /** Copie brute de l'intent (marche même si les objets ne sont pas connus de l'appli). */
+    private static String rawIntent(Intent intent) {
+        Parcel p = Parcel.obtain();
+        try {
+            intent.writeToParcel(p, 0);
+            byte[] a = p.marshall();
+            StringBuilder hex = new StringBuilder("hex[");
+            StringBuilder asc = new StringBuilder(" ascii[");
+            for (int i = 0; i < a.length && i < 768; i++) {
+                hex.append(String.format("%02X", a[i]));
+                if (i % 4 == 3) hex.append(' ');
+                int c = a[i] & 0xff;
+                asc.append(c >= 0x20 && c < 0x7f ? (char) c : '.');
+            }
+            return hex.append("] len=").append(a.length).append(asc).append(']').toString();
+        } catch (Throwable t) {
+            return "raw illisible:" + t.getClass().getSimpleName();
+        } finally {
+            p.recycle();
+        }
     }
 
     @SuppressWarnings("deprecation")
@@ -753,6 +908,22 @@ public class MainActivity extends Activity {
             String line;
             while ((line = br.readLine()) != null && !line.isEmpty()) { /* en-têtes ignorés */ }
 
+            OutputStream os = sock.getOutputStream();
+            if (path.startsWith("/canbus.apk")) {
+                String src = canbusApk != null ? canbusApk : "/system/priv-app/QF_Canbus/QF_Canbus.apk";
+                File f = new File(src);
+                String hd = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+                        + "Content-Disposition: attachment; filename=\"QF_Canbus.apk.bin\"\r\n"
+                        + "Content-Length: " + f.length() + "\r\nConnection: close\r\n\r\n";
+                os.write(hd.getBytes(StandardCharsets.US_ASCII));
+                try (InputStream in = new FileInputStream(f)) {
+                    byte[] buf = new byte[65536];
+                    int r;
+                    while ((r = in.read(buf)) > 0) os.write(buf, 0, r);
+                }
+                os.flush();
+                return;
+            }
             byte[] body = reportText().getBytes(StandardCharsets.UTF_8);
             StringBuilder h = new StringBuilder();
             h.append("HTTP/1.1 200 OK\r\n");
@@ -763,7 +934,6 @@ public class MainActivity extends Activity {
             h.append("Cache-Control: no-store\r\n");
             h.append("Content-Length: ").append(body.length).append("\r\n");
             h.append("Connection: close\r\n\r\n");
-            OutputStream os = sock.getOutputStream();
             os.write(h.toString().getBytes(StandardCharsets.US_ASCII));
             os.write(body);
             os.flush();
