@@ -22,6 +22,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.Binder;
 import android.os.IBinder;
 import android.os.Parcel;
 import android.os.Looper;
@@ -127,6 +128,27 @@ public class MainActivity extends Activity {
     private final Map<String, Integer> counts = new TreeMap<>();
     private ServerSocket server;
 
+    // --- Canal interne de l'appli canbus (com.qf.vehicle / VehicleService) ---
+    private static final String FEATURE_DESC = "com.qf.vehicle.service.ICanBusServiceFeature";
+    private static final String CALLBACK_DESC = "com.qf.vehicle.service.ICanBusServiceCallback";
+    /** Codes AIDL « add…CallBack » (le « remove » correspondant = code + 1). */
+    private static final int[][] CAN_SUBSCRIPTIONS = {
+            {3, 0}, {5, 0}, {7, 0}, {9, 0}, {11, 0}, {13, 0}, {15, 0}, {17, 0},
+            {19, 0}, {21, 0}, {29, 0}, {37, 0}
+    };
+    private static final String[] CAN_SUB_NAMES = {
+            "Clim", "Portes/vitres", "Angle volant", "Radars", "Carrosserie (vitesse, régime, km…)",
+            "Volume ampli", "État voiture d'origine", "Caméra", "Clim dispo", "Trames brutes",
+            "Réglages d'origine", "Clignotants"
+    };
+    private IBinder canService;
+    private ServiceConnection canConn;
+    private Binder canCallback;
+    private Button btnCan;
+    private final Map<String, String> lastPacket = new HashMap<>();
+    private final Map<String, Long> lastPacketTime = new HashMap<>();
+    private final Map<String, Integer> packetCounts = new TreeMap<>();
+
     // ------------------------------------------------------------------ UI
 
     @Override
@@ -146,8 +168,10 @@ public class MainActivity extends Activity {
         Button btnSave = makeButton("Enregistrer");
         Button btnClear = makeButton("Effacer");
         Button btnApk = makeButton("Copier APK");
+        btnCan = makeButton("3. Canal CAN");
         row.addView(btnScan, weight());
         row.addView(btnListen, weight());
+        row.addView(btnCan, weight());
         row.addView(btnSave, weight());
         row.addView(btnApk, weight());
         row.addView(btnClear, weight());
@@ -174,6 +198,7 @@ public class MainActivity extends Activity {
         btnScan.setOnClickListener(v -> startScan());
         btnListen.setOnClickListener(v -> toggleListen());
         btnSave.setOnClickListener(v -> saveReport());
+        btnCan.setOnClickListener(v -> toggleCan());
         btnApk.setOnClickListener(v -> new Thread(this::copyCanbusApk, "apk").start());
         btnClear.setOnClickListener(v -> {
             synchronized (report) { report.setLength(0); }
@@ -182,7 +207,7 @@ public class MainActivity extends Activity {
         });
 
         startServer();
-        log("DS3 Probe 1.1 — " + now());
+        log("DS3 Probe 1.2 — " + now());
         log("Étape 1 : appuie sur « 1. Scanner » (1 à 2 minutes).");
         log("Étape 2 : appuie sur « 2. Écouter », puis ouvre une portière, passe la marche");
         log("          arrière, allume les phares, démarre... puis réappuie pour arrêter.");
@@ -194,7 +219,7 @@ public class MainActivity extends Activity {
         Button b = new Button(this);
         b.setText(text);
         b.setAllCaps(false);
-        b.setTextSize(16);
+        b.setTextSize(14);
         return b;
     }
 
@@ -208,6 +233,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         stopListen();
+        stopCan();
         try { if (server != null) server.close(); } catch (Exception ignored) { }
         super.onDestroy();
     }
@@ -706,6 +732,192 @@ public class MainActivity extends Activity {
         } catch (Throwable t) {
             log("Copie APK impossible : " + t);
         }
+    }
+
+    // ------------------------------------------------------------------ CANAL CAN
+
+    private void toggleCan() {
+        if (canConn != null) { stopCan(); return; }
+        canCallback = new Binder() {
+            @Override
+            protected boolean onTransact(int code, Parcel data, Parcel reply, int flags) {
+                if (code == INTERFACE_TRANSACTION) {
+                    if (reply != null) reply.writeString(CALLBACK_DESC);
+                    return true;
+                }
+                try {
+                    data.enforceInterface(CALLBACK_DESC);
+                    if (code == 1 || code == 2) {
+                        byte[] b = data.createByteArray();
+                        onCanPacket(code == 1 ? "src" : "packed", b);
+                    } else if (code == 3) {
+                        log(time() + "  [CAN] réglages LeapMotor (ignoré)");
+                    }
+                    if (reply != null) reply.writeNoException();
+                } catch (Throwable t) {
+                    log("[CAN] erreur lecture callback : " + t);
+                }
+                return true;
+            }
+        };
+        canConn = new ServiceConnection() {
+            @Override
+            public void onServiceConnected(ComponentName name, IBinder service) {
+                canService = service;
+                new Thread(() -> subscribeCan(service), "can-sub").start();
+            }
+            @Override
+            public void onServiceDisconnected(ComponentName name) {
+                log("[CAN] service canbus déconnecté");
+                canService = null;
+            }
+        };
+        Intent i = new Intent();
+        i.setComponent(new ComponentName("com.qf.vehicle", "com.qf.vehicle.service.VehicleService"));
+        boolean ok;
+        try {
+            ok = bindService(i, canConn, Context.BIND_AUTO_CREATE);
+        } catch (Throwable t) {
+            log("[CAN] connexion refusée : " + t);
+            ok = false;
+        }
+        if (!ok) {
+            log("[CAN] impossible de se connecter au service canbus.");
+            canConn = null;
+            return;
+        }
+        section("CANAL CAN — connexion au service canbus — " + now());
+        log("Bouge les commandes (portes, phares, clignotants, volant, marche arrière),");
+        log("démarre et, si possible, roule quelques mètres. Puis appuie sur « Arrêter CAN ».");
+        btnCan.setText("Arrêter CAN");
+    }
+
+    private boolean canCall(IBinder b, int code, java.util.function.Consumer<Parcel> writer) {
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(FEATURE_DESC);
+            if (writer != null) writer.accept(data);
+            // Le service renvoie « false » même quand l'appel a fonctionné : on ignore ce retour.
+            b.transact(code, data, reply, 0);
+            return true;
+        } catch (Throwable t) {
+            log("[CAN] appel " + code + " : " + t.getClass().getSimpleName() + " " + t.getMessage());
+            return false;
+        } finally {
+            data.recycle();
+            reply.recycle();
+        }
+    }
+
+    private void subscribeCan(IBinder b) {
+        // Présentation au service (identifiants du SDK constructeur pour les applis tierces).
+        canCall(b, 1, p -> {
+            p.writeByte((byte) 0);
+            p.writeString("QFApp");
+            p.writeString("832ded976b28e7ee81a688a4f4095331");
+        });
+        int ok = 0;
+        for (int k = 0; k < CAN_SUBSCRIPTIONS.length; k++) {
+            int code = CAN_SUBSCRIPTIONS[k][0];
+            if (canCall(b, code, p -> p.writeStrongBinder(canCallback))) {
+                ok++;
+                log("[CAN] abonné : " + CAN_SUB_NAMES[k]);
+            }
+        }
+        log("[CAN] " + ok + "/" + CAN_SUBSCRIPTIONS.length + " abonnements envoyés. En attente de données…");
+    }
+
+    private void stopCan() {
+        if (canConn == null) return;
+        IBinder b = canService;
+        if (b != null && canCallback != null) {
+            for (int[] sub : CAN_SUBSCRIPTIONS) {
+                final int code = sub[0] + 1;
+                canCall(b, code, p -> p.writeStrongBinder(canCallback));
+            }
+        }
+        try { unbindService(canConn); } catch (Throwable ignored) { }
+        canConn = null;
+        canService = null;
+        section("CANAL CAN ARRÊTÉ — " + now());
+        if (packetCounts.isEmpty()) {
+            log("Aucune donnée reçue du service canbus.");
+        } else {
+            log("Paquets reçus par type :");
+            for (Map.Entry<String, Integer> e : packetCounts.entrySet()) {
+                log("  " + e.getValue() + " × " + e.getKey());
+            }
+        }
+        ui.post(() -> btnCan.setText("3. Canal CAN"));
+    }
+
+    private static String packetType(byte[] b) {
+        if (b == null || b.length < 2) return "vide";
+        if (b[0] != (byte) 0x98) return "brut";
+        switch (b[1]) {
+            case 1: return "clim";
+            case 2: return "carrosserie";
+            case 3: return "portes";
+            case 4: return "radars";
+            case 6: return "angle_volant";
+            case 7: return "camera";
+            case 9: return "volume_ampli";
+            case 10: return "etat_origine";
+            case 11: return "clim_dispo";
+            case 12: return "reglages_origine";
+            case 14: return "clignotants";
+            default: return "type_" + (b[1] & 0xff);
+        }
+    }
+
+    private synchronized void onCanPacket(String channel, byte[] b) {
+        String type = channel + "/" + packetType(b);
+        Integer c = packetCounts.get(type);
+        packetCounts.put(type, c == null ? 1 : c + 1);
+        String hex = toHex(b, 160);
+        long t = System.currentTimeMillis();
+        String prev = lastPacket.get(type);
+        Long prevT = lastPacketTime.get(type);
+        if (hex.equals(prev) && prevT != null && t - prevT < 5000) return;
+        lastPacket.put(type, hex);
+        lastPacketTime.put(type, t);
+        StringBuilder sb = new StringBuilder();
+        sb.append(time()).append("  [CAN ").append(type).append("] len=")
+                .append(b == null ? 0 : b.length).append(" ").append(hex);
+        String decoded = decodePacket(b);
+        if (decoded != null) sb.append("\n      → ").append(decoded);
+        log(sb.toString());
+    }
+
+    private static int u8(byte[] b, int i) { return i < b.length ? b[i] & 0xff : -1; }
+    private static int u16(byte[] b, int i) { return i + 1 < b.length ? ((b[i] & 0xff) << 8) | (b[i + 1] & 0xff) : -1; }
+
+    /** Décodage provisoire (positions lues dans le code de l'appli canbus, à confirmer). */
+    private static String decodePacket(byte[] b) {
+        if (b == null || b.length < 4 || b[0] != (byte) 0x98) return null;
+        final int d = 3;
+        if (b[1] == 2 && b.length > d + 16) {
+            int lights = u8(b, d), body2 = u8(b, d + 4);
+            return "feux=" + Integer.toBinaryString(lights)
+                    + " | contact/embrayage/vitesse/frein=" + Integer.toBinaryString(body2)
+                    + " | vitesse=" + u16(b, d + 5)
+                    + " | régime=" + u16(b, d + 7)
+                    + " | carburant(x10)=" + u16(b, d + 9)
+                    + " | autonomie(x10)=" + u16(b, d + 11)
+                    + " | km total=" + ((u8(b, d + 13) << 16) | u16(b, d + 14))
+                    + " | portes/verrous=" + Integer.toBinaryString(u8(b, d + 2))
+                    + " | ceintures=" + Integer.toBinaryString(u8(b, d + 3));
+        }
+        return null;
+    }
+
+    private static String toHex(byte[] a, int max) {
+        if (a == null) return "null";
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < a.length && i < max; i++) sb.append(String.format("%02X ", a[i]));
+        if (a.length > max) sb.append("…");
+        return sb.toString().trim();
     }
 
     // ------------------------------------------------------------------ ÉCOUTE
