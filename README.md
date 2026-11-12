@@ -18,5 +18,8 @@ Ouvre ensuite le fichier pour l'installer.
 3. Récupère le rapport :
    - depuis l'iPhone connecté au même Wi-Fi, avec l'adresse affichée en haut (`http://IP:8080/ds3probe.txt`) ;
    - ou avec **Enregistrer**, qui crée le fichier dans `Download/`.
+4. **4. Ordi de bord** (moteur allumé) : écoute les trames brutes du boîtier Raise via le service système `mcu_service`
+   et décode l'ordinateur de bord PSA (autonomie, conso instantanée et moyenne, trajets, température extérieure).
+   Les valeurs s'affichent en direct en jaune. Réappuie pour arrêter.
 
 L'appli ne modifie rien et n'ouvre aucun port série.

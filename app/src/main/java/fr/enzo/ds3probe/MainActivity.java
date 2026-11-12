@@ -146,6 +146,9 @@ public class MainActivity extends Activity {
     private ServiceConnection canConn;
     private Binder canCallback;
     private Button btnCan;
+    private Button btnMcu;
+    private TextView live;
+    private McuTap mcuTap;
     private final Map<String, String> lastPacket = new HashMap<>();
     private final Map<String, Long> lastPacketTime = new HashMap<>();
     private final Map<String, Integer> packetCounts = new TreeMap<>();
@@ -170,9 +173,11 @@ public class MainActivity extends Activity {
         Button btnClear = makeButton("Effacer");
         Button btnApk = makeButton("Copier APK");
         btnCan = makeButton("3. Canal CAN");
+        btnMcu = makeButton("4. Ordi de bord");
         row.addView(btnScan, weight());
         row.addView(btnListen, weight());
         row.addView(btnCan, weight());
+        row.addView(btnMcu, weight());
         row.addView(btnSave, weight());
         row.addView(btnApk, weight());
         row.addView(btnClear, weight());
@@ -192,6 +197,11 @@ public class MainActivity extends Activity {
 
         root.addView(row);
         root.addView(info);
+        live = new TextView(this);
+        live.setTextColor(Color.rgb(255, 210, 90));
+        live.setTextSize(18);
+        live.setPadding(4, 0, 4, 12);
+        root.addView(live);
         root.addView(scroll, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
         setContentView(root);
@@ -200,6 +210,7 @@ public class MainActivity extends Activity {
         btnListen.setOnClickListener(v -> toggleListen());
         btnSave.setOnClickListener(v -> saveReport());
         btnCan.setOnClickListener(v -> toggleCan());
+        btnMcu.setOnClickListener(v -> toggleMcu());
         btnApk.setOnClickListener(v -> new Thread(this::copyCanbusApk, "apk").start());
         btnClear.setOnClickListener(v -> {
             synchronized (report) { report.setLength(0); }
@@ -208,10 +219,12 @@ public class MainActivity extends Activity {
         });
 
         startServer();
-        log("DS3 Probe 1.3 — " + now());
+        log("DS3 Probe 1.4 — " + now());
         log("Étape 1 : appuie sur « 1. Scanner » (1 à 2 minutes).");
         log("Étape 2 : appuie sur « 2. Écouter », puis ouvre une portière, passe la marche");
         log("          arrière, allume les phares, démarre... puis réappuie pour arrêter.");
+        log("Étape 4 : moteur allumé, appuie sur « 4. Ordi de bord », roule un peu,");
+        log("          note l'autonomie du compteur, puis réappuie pour arrêter.");
         log("Lecture seule : rien n'est modifié sur l'autoradio.");
         log("");
     }
@@ -235,6 +248,7 @@ public class MainActivity extends Activity {
     protected void onDestroy() {
         stopListen();
         stopCan();
+        if (mcuTap != null) mcuTap.stop();
         try { if (server != null) server.close(); } catch (Exception ignored) { }
         super.onDestroy();
     }
@@ -263,7 +277,7 @@ public class MainActivity extends Activity {
         return new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.FRANCE).format(new Date());
     }
 
-    private static String time() {
+    static String time() {
         return new SimpleDateFormat("HH:mm:ss.SSS", Locale.FRANCE).format(new Date());
     }
 
@@ -920,8 +934,9 @@ public class MainActivity extends Activity {
                     + " | régime=" + u16(b, d + 7) + " tr/min"
                     + " | km total=" + x10(odo)
                     + " | trajet=" + x10(u16(b, d + 18))
-                    + " | autonomie=" + x10(u16(b, d + 11))
+                    + " | autonomie=" + x10(u16(b, d + 24))
                     + " | carburant=" + x10(u16(b, d + 9))
+                    + " | reste=" + x10(u16(b, d + 11))
                     + " | conso instant.=" + x10(u16(b, d + 49))
                     + " | conso moy.=" + x10(u16(b, d + 63))
                     + " | vitesse moy.=" + u16(b, d + 51)
@@ -945,6 +960,36 @@ public class MainActivity extends Activity {
         for (int i = 0; i < a.length && i < max; i++) sb.append(String.format("%02X ", a[i]));
         if (a.length > max) sb.append("…");
         return sb.toString().trim();
+    }
+
+    // ------------------------------------------------------------------ ORDI DE BORD (MCU)
+
+    private void toggleMcu() {
+        if (mcuTap != null && mcuTap.isRunning()) {
+            final McuTap t = mcuTap;
+            new Thread(() -> {
+                section("ORDI DE BORD ARRÊTÉ — " + now());
+                t.stop();
+                ui.post(() -> btnMcu.setText("4. Ordi de bord"));
+            }, "mcu-stop").start();
+            return;
+        }
+        btnMcu.setText("Arrêter ordi");
+        new Thread(() -> {
+            McuTap.Sink sink = new McuTap.Sink() {
+                @Override public void log(String line) { MainActivity.this.log(line); }
+                @Override public void live(String line) { ui.post(() -> live.setText(line)); }
+            };
+            mcuTap = new McuTap(this, sink);
+            section("ORDI DE BORD — INSPECTION " + now());
+            mcuTap.inspect();
+            section("ORDI DE BORD — ÉCOUTE BRUTE " + now());
+            if (!mcuTap.start()) {
+                ui.post(() -> btnMcu.setText("4. Ordi de bord"));
+            } else {
+                log("Si l'écran d'origine ne met plus à jour ses infos voiture, redémarre l'autoradio.");
+            }
+        }, "mcu").start();
     }
 
     // ------------------------------------------------------------------ ÉCOUTE
@@ -1148,11 +1193,15 @@ public class MainActivity extends Activity {
             while ((line = br.readLine()) != null && !line.isEmpty()) { /* en-têtes ignorés */ }
 
             OutputStream os = sock.getOutputStream();
-            if (path.startsWith("/canbus.apk")) {
+            if (path.startsWith("/canbus.apk") || path.startsWith("/mcu.jar")) {
                 String src = canbusApk != null ? canbusApk : "/system/priv-app/QF_Canbus/QF_Canbus.apk";
+                if (path.startsWith("/mcu.jar")) {
+                    src = McuTap.findMcuJar();
+                    if (src == null) src = "/system/framework/framework.jar";
+                }
                 File f = new File(src);
                 String hd = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
-                        + "Content-Disposition: attachment; filename=\"QF_Canbus.apk.bin\"\r\n"
+                        + "Content-Disposition: attachment; filename=\"" + (path.startsWith("/mcu.jar") ? "mcu_framework.jar.bin" : "QF_Canbus.apk.bin") + "\"\r\n"
                         + "Content-Length: " + f.length() + "\r\nConnection: close\r\n\r\n";
                 os.write(hd.getBytes(StandardCharsets.US_ASCII));
                 try (InputStream in = new FileInputStream(f)) {
