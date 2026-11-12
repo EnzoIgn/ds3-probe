@@ -101,7 +101,8 @@ public class MainActivity extends Activity {
             "com.qf.action.BACKCAR_START", "com.qf.action.BACKCAR_STOP",
             "com.qf.action.ACC_ON", "com.qf.action.ACC_OFF",
             "com.qf.vehicle.action.ac_popup", "com.qf.vehicle.action.PANEL_KEY",
-            "com.qf.vehicle.ACTION_DataTrace"
+            "com.qf.vehicle.ACTION_DataTrace",
+            "com.qf.vehicle.action.TEMP_STRING", "com.qf.vehicle.action.DATA_SHARE"
     };
 
     private static final Pattern ACTION_LIKE =
@@ -207,7 +208,7 @@ public class MainActivity extends Activity {
         });
 
         startServer();
-        log("DS3 Probe 1.2 — " + now());
+        log("DS3 Probe 1.3 — " + now());
         log("Étape 1 : appuie sur « 1. Scanner » (1 à 2 minutes).");
         log("Étape 2 : appuie sur « 2. Écouter », puis ouvre une portière, passe la marche");
         log("          arrière, allume les phares, démarre... puis réappuie pour arrêter.");
@@ -787,6 +788,7 @@ public class MainActivity extends Activity {
             return;
         }
         section("CANAL CAN — connexion au service canbus — " + now());
+        if (sniffer == null) toggleListen();
         log("Bouge les commandes (portes, phares, clignotants, volant, marche arrière),");
         log("démarre et, si possible, roule quelques mètres. Puis appuie sur « Arrêter CAN ».");
         btnCan.setText("Arrêter CAN");
@@ -850,6 +852,7 @@ public class MainActivity extends Activity {
             }
         }
         ui.post(() -> btnCan.setText("3. Canal CAN"));
+        stopListen();
     }
 
     private static String packetType(byte[] b) {
@@ -871,14 +874,22 @@ public class MainActivity extends Activity {
         }
     }
 
+    private static boolean isEmptyCarbody(byte[] b) {
+        // Deuxième source interne de l'appli : paquet carrosserie vide (vitesse FFFF, km 0).
+        return b != null && b.length > 20 && b[0] == (byte) 0x98 && b[1] == 2
+                && u16(b, 8) == 0xFFFF && u8(b, 16) == 0 && u8(b, 17) == 0 && u8(b, 18) == 0;
+    }
+
     private synchronized void onCanPacket(String channel, byte[] b) {
         String type = channel + "/" + packetType(b);
+        if (isEmptyCarbody(b)) type = type + "_vide";
         Integer c = packetCounts.get(type);
         packetCounts.put(type, c == null ? 1 : c + 1);
         String hex = toHex(b, 160);
         long t = System.currentTimeMillis();
         String prev = lastPacket.get(type);
         Long prevT = lastPacketTime.get(type);
+        if (type.endsWith("_vide")) return;
         if (hex.equals(prev) && prevT != null && t - prevT < 5000) return;
         lastPacket.put(type, hex);
         lastPacketTime.put(type, t);
@@ -893,21 +904,37 @@ public class MainActivity extends Activity {
     private static int u8(byte[] b, int i) { return i < b.length ? b[i] & 0xff : -1; }
     private static int u16(byte[] b, int i) { return i + 1 < b.length ? ((b[i] & 0xff) << 8) | (b[i + 1] & 0xff) : -1; }
 
+    private static String x10(int v) {
+        if (v < 0) return "?";
+        return (v / 10) + "," + (v % 10);
+    }
+
     /** Décodage provisoire (positions lues dans le code de l'appli canbus, à confirmer). */
     private static String decodePacket(byte[] b) {
         if (b == null || b.length < 4 || b[0] != (byte) 0x98) return null;
         final int d = 3;
-        if (b[1] == 2 && b.length > d + 16) {
-            int lights = u8(b, d), body2 = u8(b, d + 4);
-            return "feux=" + Integer.toBinaryString(lights)
-                    + " | contact/embrayage/vitesse/frein=" + Integer.toBinaryString(body2)
-                    + " | vitesse=" + u16(b, d + 5)
-                    + " | régime=" + u16(b, d + 7)
-                    + " | carburant(x10)=" + u16(b, d + 9)
-                    + " | autonomie(x10)=" + u16(b, d + 11)
-                    + " | km total=" + ((u8(b, d + 13) << 16) | u16(b, d + 14))
-                    + " | portes/verrous=" + Integer.toBinaryString(u8(b, d + 2))
-                    + " | ceintures=" + Integer.toBinaryString(u8(b, d + 3));
+        if (b[1] == 2 && b.length > d + 77) {
+            int odo = (u8(b, d + 13) << 16) | u16(b, d + 14);
+            int body = u8(b, d + 4);
+            return "vitesse=" + u16(b, d + 5) + " km/h"
+                    + " | régime=" + u16(b, d + 7) + " tr/min"
+                    + " | km total=" + x10(odo)
+                    + " | trajet=" + x10(u16(b, d + 18))
+                    + " | autonomie=" + x10(u16(b, d + 11))
+                    + " | carburant=" + x10(u16(b, d + 9))
+                    + " | conso instant.=" + x10(u16(b, d + 49))
+                    + " | conso moy.=" + x10(u16(b, d + 63))
+                    + " | vitesse moy.=" + u16(b, d + 51)
+                    + " | contact=" + ((body >> 7) & 1) + " embrayage=" + ((body >> 6) & 1)
+                    + " frein_main=" + ((body >> 4) & 1)
+                    + " | feux=" + Integer.toBinaryString(u8(b, d)) + "/" + Integer.toBinaryString(u8(b, d + 1))
+                    + " | octet ceintures=" + Integer.toBinaryString(u8(b, d + 3));
+        }
+        if (b[1] == 3 && b.length >= 5) {
+            int v = u8(b, 3);
+            return "AVG=" + ((v >> 7) & 1) + " AVD=" + ((v >> 6) & 1) + " ARG=" + ((v >> 5) & 1)
+                    + " ARD=" + ((v >> 4) & 1) + " coffre=" + ((v >> 3) & 1) + " autres=" + Integer.toBinaryString(v & 7)
+                    + "  (1 = ouvert, à confirmer)";
         }
         return null;
     }
